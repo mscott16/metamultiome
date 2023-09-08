@@ -1,0 +1,640 @@
+#glmmSeq code for each group (this file is specifically for CEFT)
+#Libraries ---------------------------------------------------------------
+#load libraries
+library(ggplot2)
+library(ggvis)
+library(plyr)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(locfit)
+library(scales)
+library(edgeR)
+library(viridis)
+library(sva)
+library(glmmSeq)
+library(openxlsx)
+library(PCAtools)
+library(Biobase)
+library(ggpubr)
+
+packageurl <- "https://cran.r-project.org/src/contrib/Archive/glmmSeq/glmmSeq_0.2.0.tar.gz"
+install.packages(packageurl, repos=NULL, type="source")
+
+
+# WD, raw data, metadata --------------------------------------------------
+#working directory
+setwd("C:/Users/mscott/...")
+
+#load in raw count data
+##had to add data.matrix with data.w.rownames; kept running into data matrix error...
+raw_data = read.csv("RB_252_raw_gene_count.csv",header=TRUE, check.names = TRUE)
+data.w.rownames <- data.matrix(data.frame(raw_data[,-1], row.names=raw_data[,1]))
+
+#load in metadata
+traitdata = read.csv("RB_252_Metadata_RAB.csv")
+treatment = factor(traitdata$Group)
+
+
+# CombatSeq, pre-processing low counts -----------------------------------------------
+#combat-seq for batch effect
+adjusted <- ComBat_seq(data.w.rownames, batch = traitdata$Lane, group = traitdata$Group)
+write.csv(adjusted, file = "combat_adjusted_counts.csv")
+
+#pre-processing low read counts
+keepexper<- filterByExpr(data.w.rownames, min.count = 0, min.total.count = 100, group = traitdata$Group)
+x<-data.w.rownames[keepexper,]
+dim(x)
+
+sum(data.w.rownames)
+#sum(adjusted)
+sum(x)
+
+keep<-rowSums(cpm(x)>0.2) >= 12
+y<-x[keep,]
+dim(y)
+write.csv(y, file = "filt_adjusted_counts.csv")
+
+#create read matrix
+dgedata <- DGEList(counts=y, group=traitdata$Group)
+dgedata$samples
+
+#evaluating library sizes by sample_ID
+barplot(dgedata$samples$lib.size, names=colnames(dgedata),las=2, cex.names=.55, col=plasma(7)[traitdata$Group])
+title("Total Library Count per Sample")
+abline(h=median(dgedata$samples$lib.size),col="black")
+
+plotMDS(dgedata)
+
+
+# evaluate for DEGs vie glmmSeq -------------------------------------------
+###evaluate for DEGs via glmmSeq###
+dgedata_glmm <- DGEList(counts=y)
+
+#calculate normalization factors via edgeR TMM method
+##data is considered non-sparse after 0-filtering
+glmm_normal <- calcNormFactors(y, method = c("TMM"))
+write.csv(glmm_normal, file = "norm_total.csv")
+
+obj1<- read.csv("norm_total.csv")
+obj_ceft<-read.csv("norm_ceft.csv")
+
+points<-c(16,17,18,15)
+plotMDS(z,col=magma(4)[days], cex = 3, top = 1000, dim.plot = c(1,2),
+        gene.selection = "common", xlab = "Dimension 1", ylab = "Dimension 2",
+        pch = points[traitdata$Group])
+
+#estimate tagwise dispersion (edgeR method)
+edisp2<-setNames(edgeR::estimateDisp(dgedata_glmm)$tagwise.dispersion, rownames(dgedata_glmm))
+edisp2
+
+#Ceft testing
+traitdata_ceft = read.csv("Metadata_ceft.csv")
+a_ID=factor(rep(c(traitdata_ceft$Animal_ID)))
+time_point=factor(rep(c(traitdata_ceft$Timepoint)))
+Group<- factor(rep(c(traitdata_ceft$Group)))
+breed<-factor(rep(c(traitdata_ceft$Breed)))
+lane<-factor(rep(c(traitdata_ceft$Lane)))
+
+counts_ceft<-read.csv("filt_adjusted_counts_ceft.csv",header=TRUE, check.names = TRUE)
+abc<-data.matrix(data.frame(counts_ceft[,-1], row.names=counts_ceft[,1]))
+
+dgedata_ceft <- DGEList(counts=abc)
+glmm_normal <- calcNormFactors(abc, method = c("TMM"))
+edisp2<-setNames(edgeR::estimateDisp(dgedata_ceft)$tagwise.dispersion, rownames(dgedata_ceft))
+#running glmm model - adjust cores as necessary
+#ran in 59 min, 18s.  
+results <- glmmSeq(~ Timepoint + Group + Timepoint:Group + (1 | Breed) + (1 | Animal_ID),
+                   countdata = dgedata_ceft$counts,
+                   metadata = traitdata_ceft,
+                   id = "Animal_ID",
+                   dispersion = edisp2,
+                   sizeFactors = glmm_normal,
+                   removeDuplicatedMeasures = FALSE,
+                   removeSingles=FALSE,
+                   progress=TRUE,
+                   cores = 4)
+
+names(attributes(results))
+results@stats
+results@modelData
+
+#calculate Qvalues; pi0 adjusted to 1 to enact BH procedure
+qvals<-glmmQvals(results, pi0 = 1)
+qvals@stats
+
+predict = data.frame(results@predict)
+stats_ceft= data.frame(results@stats)
+glmdegs_ceft = data.frame(qvals@stats)
+
+#write analysis table to csv file
+write.csv(stats, file = "glmm_stats_ceft.csv")
+write.csv(glmdegs, file = "glmm_degs_ceft.csv")
+
+
+
+# Plots -------------------------------------------------------------------
+pairedPlot(glmmResult=qvals,
+           geneName = "ITK",
+           x1Label = "Timepoint",
+           x2Label="Group",
+           xTitle="Timepoint",
+           yTitle = "log10 Gene Expression",
+           IDColumn = "Animal_ID",
+           graphics = "ggplot",
+           colours = magma(8, begin = 0, end = 0.75),
+           modelColour = mako(8, direction = -1),
+           modelLineColour = mako(8, begin = 0, end = 0.75, direction = -1),
+           fontSize=10,
+           x2Offset = 8,
+           logTransform=TRUE,
+           addViolin = TRUE,
+           pairedOnly = FALSE,
+           addModel = FALSE)
+
+pairedPlot(glmmResult=qvals,
+           geneName = "SKP1",
+           x1Label = "Timepoint",
+           x2Label="Group",
+           xTitle="Timepoint",
+           yTitle = "log10 Gene Expression",
+           IDColumn = "Animal_ID",
+           graphics = "ggplot",
+           colours = mako(8, begin = 0, end = 0.75),
+           modelColour = mako(8, direction = -1),
+           modelLineColour = mako(8, begin = 0, end = 0.75, direction = -1),
+           fontSize=16,
+           x2Offset = 8,
+           logTransform=TRUE,
+           addViolin = TRUE,
+           pairedOnly = FALSE,
+           addBox =  TRUE,
+           addModel = FALSE)
+
+modelPlot(glmmResult=qvals,
+          "RPS27A",
+          x1Label="Timepoint",
+          x2Label="Group",
+          xTitle="Timepoint",
+          yTitle = "Normalized Gene Expression",
+          fontSize=16,
+          x2Offset=1,
+          addErrorbars = TRUE,
+          overlap=TRUE,
+          graphics="ggplot",
+          logTransform = TRUE,
+          colours = turbo(2, begin = 0.85, end = 0)) + ylim(0,NA)
+
+#edgeR code for each group (this file is specifically for CEFT)
+# Libraries ---------------------------------------------------------------
+#load libraries
+library(ggplot2)
+library(ggvis)
+library(plyr)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(locfit)
+library(scales)
+library(edgeR)
+library(viridis)
+library(sva)
+library(glmmSeq)
+library(openxlsx)
+library(PCAtools)
+library(Biobase)
+library(ggpubr)
+
+
+# WD, raw data, metadata ----------------------------------------------------------------------
+#set working directory
+setwd("C:/Users/mscott/...")
+
+#load in raw count data
+##had to add data.matrix with data.w.rownames; kept running into data matrix error...
+raw_data = read.csv("RB_252_raw_gene_count_CEFT.csv",header=TRUE, check.names = TRUE)
+data.w.rownames <- data.matrix(data.frame(raw_data[,-1], row.names=raw_data[,1]))
+
+#load in metadata
+traitdata = read.csv("RB_252_Metadata_RAB__adj_A_num.csv")
+treatment = factor(traitdata$Group)
+
+
+# Adjusting data ----------------------------------------------------------
+keepexper<- filterByExpr(data.w.rownames, min.count = 0, min.total.count = 100, group = treatment)
+x<-data.w.rownames[keepexper,]
+dim(x)
+
+sum(data.w.rownames)
+#sum(adjusted)
+sum(x)
+
+keep<-rowSums(cpm(x)>0.2) >= 12
+y<-x[keep,]
+dim(y)
+
+dgedata <- DGEList(counts=y, group=treatment)
+dgedata$samples
+
+#evaluating library sizes by sample_ID
+barplot(dgedata$samples$lib.size, names=colnames(dgedata),las=2, cex.names=.55, col=plasma(2)[treatment])
+title("Total Library Count per Sample")
+abline(h=median(dgedata$samples$lib.size),col="black")
+
+dgedata_norm <- calcNormFactors(dgedata, method = c("TMM"))
+dgedata_norm$samples
+#(count/(library size*normalization factor))*1,000,000 = CPM
+#Normalization is based on TMM as default - between sample normalization
+
+#logCPM transformation of normalized data
+x2<-dgedata_norm
+lcpm<-cpm(x2, log = TRUE)
+write.csv(lcpm,"lcpm_norm.csv")
+
+#plot the sample variation via MDS
+#http://www.stat.columbia.edu/~tzheng/files/Rcolor.pdf
+colors<-rep(c("steelblue4","orangered3"),1)
+points<-c(15,17)
+dgedata_norm
+color=viridis(6)
+time<-factor(traitdata$Timepoint)
+plotMDS(dgedata_norm)
+plotMDS(dgedata_norm,col=viridis(6)[time],  cex = 1.25, dim.plot = c(1,2), top = 100)
+legend("bottomleft", legend=levels(time), col=color, ncol = 2, cex = 1)
+
+
+# Matrix design and dispersion values -------------------------------------
+animalID=(traitdata$A_num)
+treat_group=factor(traitdata$Combo_Group)
+design<-model.matrix(~0+animalID+treat_group)
+rownames(design) <- colnames(dgedata)
+design
+
+
+#calculate dispersion values
+newtest_direct <- estimateDisp(dgedata, design)
+newtest_direct <- estimateGLMCommonDisp(newtest_direct, design)
+newtest_direct <- estimateGLMTrendedDisp(newtest_direct, design)
+newtest_direct <- estimateGLMTagwiseDisp(newtest_direct, design)
+newtest_direct
+
+
+# Contrasts ---------------------------------------------------------------
+#BCV plot for variation visualization
+plotBCV(newtest_direct)
+treat_groupControl_T1 
+treat_groupControl_T2 
+treat_groupControl_T3
+treat_groupControl_T4
+treat_groupControl_T5
+treat_groupControl_T6
+treat_groupCeft_T1
+treat_groupCeft_T2
+treat_groupCeft_T3
+treat_groupCeft_T4
+treat_groupCeft_T5
+treat_groupCeft_T6
+
+cont<-makeContrasts(groupT1 = treat_groupControl_T1-treat_groupCeft_T1,
+                    groupT2 = treat_groupControl_T2-treat_groupCeft_T2,
+                    groupT3 = treat_groupControl_T3-treat_groupCeft_T3,
+                    groupT4 = treat_groupControl_T4-treat_groupCeft_T4,
+                    groupT5 = treat_groupControl_T5-treat_groupCeft_T5,
+                    groupT6 = treat_groupControl_T6-treat_groupCeft_T6,
+                    Ceft_1v2 = treat_groupCeft_T1-treat_groupCeft_T2,
+                    Ceft_1v3 = treat_groupCeft_T1-treat_groupCeft_T3,
+                    Ceft_1v4 = treat_groupCeft_T1-treat_groupCeft_T4,
+                    Ceft_1v5 = treat_groupCeft_T1-treat_groupCeft_T5,
+                    Ceft_1v6 = treat_groupCeft_T1-treat_groupCeft_T6,
+                    Ceft_2v3 = treat_groupCeft_T2-treat_groupCeft_T3,
+                    Ceft_2v4 = treat_groupCeft_T2-treat_groupCeft_T4,
+                    Ceft_2v5 = treat_groupCeft_T2-treat_groupCeft_T5,
+                    Ceft_2v6 = treat_groupCeft_T2-treat_groupCeft_T6,
+                    Ceft_3v4 = treat_groupCeft_T3-treat_groupCeft_T4,
+                    Ceft_3v5 = treat_groupCeft_T3-treat_groupCeft_T5,
+                    Ceft_3v6 = treat_groupCeft_T3-treat_groupCeft_T6,
+                    Ceft_4v5 = treat_groupCeft_T4-treat_groupCeft_T5,
+                    Ceft_4v6 = treat_groupCeft_T4-treat_groupCeft_T6,
+                    Ceft_5v6 = treat_groupCeft_T5-treat_groupCeft_T6,
+                    Control_1v2 = treat_groupControl_T1-treat_groupControl_T2,
+                    Control_1v3 = treat_groupControl_T1-treat_groupControl_T3,
+                    Control_1v4 = treat_groupControl_T1-treat_groupControl_T4,
+                    Control_1v5 = treat_groupControl_T1-treat_groupControl_T5,
+                    Control_1v6 = treat_groupControl_T1-treat_groupControl_T6,
+                    Control_2v3 = treat_groupControl_T2-treat_groupControl_T3,
+                    Control_2v4 = treat_groupControl_T2-treat_groupControl_T4,
+                    Control_2v5 = treat_groupControl_T2-treat_groupControl_T5,
+                    Control_2v6 = treat_groupControl_T2-treat_groupControl_T6,
+                    Control_3v4 = treat_groupControl_T3-treat_groupControl_T4,
+                    Control_3v5 = treat_groupControl_T3-treat_groupControl_T5,
+                    Control_3v6 = treat_groupControl_T3-treat_groupControl_T6,
+                    Control_4v5 = treat_groupControl_T4-treat_groupControl_T5,
+                    Control_4v6 = treat_groupControl_T4-treat_groupControl_T6,
+                    Control_5v6 = treat_groupControl_T5-treat_groupControl_T6,
+                    levels = design)
+
+
+# DE analysis w/likelihood ratio testing ----------------------------------
+#DE analysis w/likelihood ratio testing
+#saletest_direct <-makeContrasts(cont, levels = design)
+fit_direct <- glmFit(newtest_direct, design)
+#qlf_direct <- glmLRT(fit_direct,contrast = saletest_direct)
+glmCeft1v2<-glmLRT(fit_direct, contrast = cont[,"Ceft_1v2"])
+glmCeft1v3<-glmLRT(fit_direct, contrast = cont[,"Ceft_1v3"])
+glmCeft1v4<-glmLRT(fit_direct, contrast = cont[,"Ceft_1v4"])
+glmCeft1v5<-glmLRT(fit_direct, contrast = cont[,"Ceft_1v5"])
+glmCeft1v6<-glmLRT(fit_direct, contrast = cont[,"Ceft_1v6"])
+glmCeft2v3<-glmLRT(fit_direct, contrast = cont[,"Ceft_2v3"])
+glmCeft2v4<-glmLRT(fit_direct, contrast = cont[,"Ceft_2v4"])
+glmCeft2v5<-glmLRT(fit_direct, contrast = cont[,"Ceft_2v5"])
+glmCeft2v6<-glmLRT(fit_direct, contrast = cont[,"Ceft_2v6"])
+glmCeft3v4<-glmLRT(fit_direct, contrast = cont[,"Ceft_3v4"])
+glmCeft3v5<-glmLRT(fit_direct, contrast = cont[,"Ceft_3v5"])
+glmCeft3v6<-glmLRT(fit_direct, contrast = cont[,"Ceft_3v6"])
+glmCeft4v5<-glmLRT(fit_direct, contrast = cont[,"Ceft_4v5"])
+glmCeft4v6<-glmLRT(fit_direct, contrast = cont[,"Ceft_4v6"])
+glmCeft5v6<-glmLRT(fit_direct, contrast = cont[,"Ceft_5v6"])
+
+glmCon1v2<-glmLRT(fit_direct, contrast = cont[,"Control_1v2"])
+glmCon1v3<-glmLRT(fit_direct, contrast = cont[,"Control_1v3"])
+glmCon1v4<-glmLRT(fit_direct, contrast = cont[,"Control_1v4"])
+glmCon1v5<-glmLRT(fit_direct, contrast = cont[,"Control_1v5"])
+glmCon1v6<-glmLRT(fit_direct, contrast = cont[,"Control_1v6"])
+glmCon2v3<-glmLRT(fit_direct, contrast = cont[,"Control_2v3"])
+glmCon2v4<-glmLRT(fit_direct, contrast = cont[,"Control_2v4"])
+glmCon2v5<-glmLRT(fit_direct, contrast = cont[,"Control_2v5"])
+glmCon2v6<-glmLRT(fit_direct, contrast = cont[,"Control_2v6"])
+glmCon3v4<-glmLRT(fit_direct, contrast = cont[,"Control_3v4"])
+glmCon3v5<-glmLRT(fit_direct, contrast = cont[,"Control_3v5"])
+glmCon3v6<-glmLRT(fit_direct, contrast = cont[,"Control_3v6"])
+glmCon4v5<-glmLRT(fit_direct, contrast = cont[,"Control_4v5"])
+glmCon4v6<-glmLRT(fit_direct, contrast = cont[,"Control_4v6"])
+glmCon5v6<-glmLRT(fit_direct, contrast = cont[,"Control_5v6"])
+
+glmgroup_T1<-glmLRT(fit_direct, contrast = cont[,"groupT1"])
+glmgroup_T2<-glmLRT(fit_direct, contrast = cont[,"groupT2"])
+glmgroup_T3<-glmLRT(fit_direct, contrast = cont[,"groupT3"])
+glmgroup_T4<-glmLRT(fit_direct, contrast = cont[,"groupT4"])
+glmgroup_T5<-glmLRT(fit_direct, contrast = cont[,"groupT5"])
+glmgroup_T6<-glmLRT(fit_direct, contrast = cont[,"groupT6"])
+
+
+# DEG lists ---------------------------------------------------------------
+#Ceft
+DElist1<-topTags(glmCeft1v2,n=1000, p.value =  0.05)
+allgenes1<-topTags(glmCeft1v2, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft1v2,p.value = 0.05))
+dim(DElist1)
+
+DElist2<-topTags(glmCeft1v3,n=1000, p.value =  0.05)
+allgenes2<-topTags(glmCeft1v3, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft1v3,p.value = 0.05))
+dim(DElist2)
+
+DElist3<-topTags(glmCeft1v4,n=1000, p.value =  0.05)
+allgenes3<-topTags(glmCeft1v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft1v4,p.value = 0.05))
+dim(DElist3)
+
+DElist4<-topTags(glmCeft1v5,n=1000, p.value =  0.05)
+allgenes4<-topTags(glmCeft1v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft1v5,p.value = 0.05))
+dim(DElist4)
+
+DElist5<-topTags(glmCeft1v6,n=1000, p.value =  0.05)
+allgenes5<-topTags(glmCeft1v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft1v6,p.value = 0.05))
+dim(DElist5)
+
+DElist6<-topTags(glmCeft2v3,n=1000, p.value =  0.05)
+allgenes6<-topTags(glmCeft2v3, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft2v3,p.value = 0.05))
+dim(DElist6)
+
+DElist7<-topTags(glmCeft2v4,n=1000, p.value =  0.05)
+allgenes7<-topTags(glmCeft2v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft2v4,p.value = 0.05))
+dim(DElist7)
+
+DElist8<-topTags(glmCeft2v5,n=1000, p.value =  0.05)
+allgenes8<-topTags(glmCeft2v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft2v5,p.value = 0.05))
+dim(DElist8)
+
+DElist9<-topTags(glmCeft2v6,n=1000, p.value =  0.05)
+allgenes9<-topTags(glmCeft2v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft2v6,p.value = 0.05))
+dim(DElist9)
+
+DElist10<-topTags(glmCeft3v4,n=1000, p.value =  0.05)
+allgenes10<-topTags(glmCeft3v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft3v4,p.value = 0.05))
+dim(DElist10)
+
+DElist11<-topTags(glmCeft3v5,n=1000, p.value =  0.05)
+allgenes11<-topTags(glmCeft3v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft3v5,p.value = 0.05))
+dim(DElist11)
+
+DElist12<-topTags(glmCeft3v6,n=1000, p.value =  0.05)
+allgenes12<-topTags(glmCeft3v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft3v6,p.value = 0.05))
+dim(DElist12)
+
+DElist13<-topTags(glmCeft4v5,n=1000, p.value =  0.05)
+allgenes13<-topTags(glmCeft4v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft4v5,p.value = 0.05))
+dim(DElist13)
+
+DElist14<-topTags(glmCeft4v6,n=1000, p.value =  0.05)
+allgenes14<-topTags(glmCeft4v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft4v6,p.value = 0.05))
+dim(DElist14)
+
+DElist15<-topTags(glmCeft5v6,n=1000, p.value =  0.05)
+allgenes15<-topTags(glmCeft5v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCeft5v6,p.value = 0.05))
+dim(DElist15)
+
+#controls
+DElist16<-topTags(glmCon1v2,n=1000, p.value =  0.05)
+allgenes16<-topTags(glmCon1v2, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon1v2,p.value = 0.05))
+dim(DElist16)
+
+DElist17<-topTags(glmCon1v3,n=1000, p.value =  0.05)
+allgenes17<-topTags(glmCon1v3, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon1v3,p.value = 0.05))
+dim(DElist17)
+
+DElist18<-topTags(glmCon1v4,n=1000, p.value =  0.05)
+allgenes18<-topTags(glmCon1v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon1v4,p.value = 0.05))
+dim(DElist18)
+
+DElist19<-topTags(glmCon1v5,n=1000, p.value =  0.05)
+allgenes19<-topTags(glmCon1v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon1v5,p.value = 0.05))
+dim(DElist19)
+
+DElist20<-topTags(glmCon1v6,n=1000, p.value =  0.05)
+allgenes20<-topTags(glmCon1v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon1v6,p.value = 0.05))
+dim(DElist20)
+
+DElist21<-topTags(glmCon2v3,n=1000, p.value =  0.05)
+allgenes21<-topTags(glmCon2v3, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon2v3,p.value = 0.05))
+dim(DElist21)
+
+DElist22<-topTags(glmCon2v4,n=1000, p.value =  0.05)
+allgenes22<-topTags(glmCon2v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon2v4,p.value = 0.05))
+dim(DElist22)
+
+DElist23<-topTags(glmCon2v5,n=1000, p.value =  0.05)
+allgenes23<-topTags(glmCon2v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon2v5,p.value = 0.05))
+dim(DElist23)
+
+DElist24<-topTags(glmCon2v6,n=1000, p.value =  0.05)
+allgenes24<-topTags(glmCon2v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon2v6,p.value = 0.05))
+dim(DElist24)
+
+DElist25<-topTags(glmCon3v4,n=1000, p.value =  0.05)
+allgenes25<-topTags(glmCon3v4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon3v4,p.value = 0.05))
+dim(DElist25)
+
+DElist26<-topTags(glmCon3v5,n=1000, p.value =  0.05)
+allgenes26<-topTags(glmCon3v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon3v5,p.value = 0.05))
+dim(DElist26)
+
+DElist27<-topTags(glmCon3v6,n=1000, p.value =  0.05)
+allgenes27<-topTags(glmCon3v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon3v6,p.value = 0.05))
+dim(DElist27)
+
+DElist28<-topTags(glmCon4v5,n=1000, p.value =  0.05)
+allgenes28<-topTags(glmCon4v5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon4v5,p.value = 0.05))
+dim(DElist28)
+
+DElist29<-topTags(glmCon4v6,n=1000, p.value =  0.05)
+allgenes29<-topTags(glmCon4v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon4v6,p.value = 0.05))
+dim(DElist29)
+
+DElist30<-topTags(glmCon5v6,n=1000, p.value =  0.05)
+allgenes30<-topTags(glmCon5v6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmCon5v6,p.value = 0.05))
+dim(DElist30)
+
+#group-based comparisons
+DElist31<-topTags(glmgroup_T1,n=1000, p.value =  0.05)
+allgenes31<-topTags(glmgroup_T1, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T1,p.value = 0.05))
+dim(DElist31)
+
+DElist32<-topTags(glmgroup_T2,n=1000, p.value =  0.05)
+allgenes32<-topTags(glmgroup_T2, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T2,p.value = 0.05))
+dim(DElist32)
+
+DElist33<-topTags(glmgroup_T3,n=1000, p.value =  0.05)
+allgenes33<-topTags(glmgroup_T3, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T3,p.value = 0.05))
+dim(DElist33)
+
+DElist34<-topTags(glmgroup_T4,n=1000, p.value =  0.05)
+allgenes34<-topTags(glmgroup_T4, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T4,p.value = 0.05))
+dim(DElist34)
+
+DElist35<-topTags(glmgroup_T5,n=1000, p.value =  0.05)
+allgenes35<-topTags(glmgroup_T5, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T5,p.value = 0.05))
+dim(DElist35)
+
+DElist36<-topTags(glmgroup_T6,n=1000, p.value =  0.05)
+allgenes36<-topTags(glmgroup_T6, n=20000, p.value = 1.0)
+summary(decideTests.DGELRT(glmgroup_T6,p.value = 0.05))
+dim(DElist36)
+
+ceftvscon<- createWorkbook("CeftvsCon_27Feb23")
+addWorksheet(ceftvscon, "Ceft_1v2")
+addWorksheet(ceftvscon, "Ceft_1v3")
+addWorksheet(ceftvscon, "Ceft_1v4")
+addWorksheet(ceftvscon, "Ceft_1v5")
+addWorksheet(ceftvscon, "Ceft_1v6")
+addWorksheet(ceftvscon, "Ceft_2v3")
+addWorksheet(ceftvscon, "Ceft_2v4")
+addWorksheet(ceftvscon, "Ceft_2v5")
+addWorksheet(ceftvscon, "Ceft_2v6")
+addWorksheet(ceftvscon, "Ceft_3v4")
+addWorksheet(ceftvscon, "Ceft_3v5")
+addWorksheet(ceftvscon, "Ceft_3v6")
+addWorksheet(ceftvscon, "Ceft_4v5")
+addWorksheet(ceftvscon, "Ceft_4v6")
+addWorksheet(ceftvscon, "Ceft_5v6")
+addWorksheet(ceftvscon, "Control_1v2")
+addWorksheet(ceftvscon, "Control_1v3")
+addWorksheet(ceftvscon, "Control_1v4")
+addWorksheet(ceftvscon, "Control_1v5")
+addWorksheet(ceftvscon, "Control_1v6")
+addWorksheet(ceftvscon, "Control_2v3")
+addWorksheet(ceftvscon, "Control_2v4")
+addWorksheet(ceftvscon, "Control_2v5")
+addWorksheet(ceftvscon, "Control_2v6")
+addWorksheet(ceftvscon, "Control_3v4")
+addWorksheet(ceftvscon, "Control_3v5")
+addWorksheet(ceftvscon, "Control_3v6")
+addWorksheet(ceftvscon, "Control_4v5")
+addWorksheet(ceftvscon, "Control_4v6")
+addWorksheet(ceftvscon, "Control_5v6")
+addWorksheet(ceftvscon, "groupT1")
+addWorksheet(ceftvscon, "groupT2")
+addWorksheet(ceftvscon, "groupT3")
+addWorksheet(ceftvscon, "groupT4")
+addWorksheet(ceftvscon, "groupT5")
+addWorksheet(ceftvscon, "groupT6")
+
+writeData(ceftvscon, sheet = "Ceft_1v2",allgenes1$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_1v3",allgenes2$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_1v4",allgenes3$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_1v5",allgenes4$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_1v6",allgenes5$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_2v3",allgenes6$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_2v4",allgenes7$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_2v5",allgenes8$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_2v6",allgenes9$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_3v4",allgenes10$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_3v5",allgenes11$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_3v6",allgenes12$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_4v5",allgenes13$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_4v6",allgenes14$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Ceft_5v6",allgenes15$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_1v2",allgenes16$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_1v3",allgenes17$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_1v4",allgenes18$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_1v5",allgenes19$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_1v6",allgenes20$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_2v3",allgenes21$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_2v4",allgenes22$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_2v5",allgenes23$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_2v6",allgenes24$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_3v4",allgenes25$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_3v5",allgenes26$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_3v6",allgenes27$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_4v5",allgenes28$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_4v6",allgenes29$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "Control_5v6",allgenes30$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT1",allgenes31$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT2",allgenes32$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT3",allgenes33$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT4",allgenes34$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT5",allgenes35$table, rowNames = TRUE)
+writeData(ceftvscon, sheet = "groupT6",allgenes36$table, rowNames = TRUE)
+saveWorkbook(ceftvscon, "CeftvsCon.xlsx")
